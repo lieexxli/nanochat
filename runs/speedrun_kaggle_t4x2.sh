@@ -16,7 +16,7 @@ mkdir -p $NANOCHAT_BASE_DIR
 # Python 环境设置（使用 pip，适合 Kaggle 环境）
 
 # 安装项目依赖（Kaggle 已预装大部分包，只需安装缺失的）
-pip install -q tiktoken wandb huggingface_hub datasets blobfile tqdm
+pip install -q tiktoken wandb huggingface_hub datasets blobfile tqdm rustbpe
 pip install -q flash-attn --no-build-isolation 2>/dev/null || echo "Flash Attention 安装失败，将使用标准注意力"
 
 # -----------------------------------------------------------------------------
