@@ -19,14 +19,15 @@ import time
 import math
 import argparse
 from dataclasses import asdict
-from contextlib import nullcontext, contextmanager
+from contextlib import contextmanager
 
 import wandb
 import torch
+import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
@@ -59,19 +60,17 @@ parser.add_argument("--target-param-data-ratio", type=float, default=10.5, help=
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
-parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
+parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
+parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
-parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
-parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
-parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
-parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
-parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
+parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
+parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
+parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
-parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
+parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
@@ -86,7 +85,6 @@ user_config = vars(args).copy()  # for logging
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
@@ -95,17 +93,23 @@ if device_type == "cuda":
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
 # Flash Attention status
-if HAS_FA3:
+from nanochat.flash_attention import USE_FA3
+using_fa3 = USE_FA3
+if using_fa3:
     print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
 else:
     print0("!" * 80)
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
+    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
+        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
+    else:
+        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
     print0("WARNING: Training will be less efficient without FA3")
     if args.window_pattern != "L":
         print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
@@ -165,23 +169,27 @@ if args.fp8:
     if device_type != "cuda":
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
     else:
-        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+        # our custom fp8 is simpler than torchao, written for exact API compatibility
+        from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
+        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
         import torch.nn as nn
 
-        # Filter: only convert layers with dimensions divisible by 16 (FP8 hardware requirement)
+        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
         def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
             if not isinstance(mod, nn.Linear):
                 return False
-            # FP8 requires both in_features and out_features divisible by 16
             if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
+                return False
+            if min(mod.in_features, mod.out_features) < 128:
                 return False
             return True
 
         fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
+        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
         convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
-        num_fp8_layers = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-        num_skipped = sum(1 for m in model.modules() if isinstance(m, nn.Linear)) - num_fp8_layers
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8_layers} layers, skipped {num_skipped} (dims not divisible by 16)")
+        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
+        num_skipped = num_linear - num_fp8
+        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
 
 # Context manager to temporarily disable FP8 so that model evaluation remains in BF16
 @contextmanager
@@ -209,9 +217,9 @@ def disable_fp8(model):
         yield  # No FP8 modules, nothing to do
         return
 
-    # Swap Float8Linear -> nn.Linear (shares the same weight tensor, no copy)
+    # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype)
     for parent, attr_name, fp8_module in fp8_locations:
-        linear = nn.Linear(
+        linear = Linear(
             fp8_module.in_features,
             fp8_module.out_features,
             bias=fp8_module.bias is not None,
@@ -237,11 +245,9 @@ orig_model = model # original, uncompiled model, for saving raw model state_dict
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
-# Determine the optimization horizon based on the model size
-# The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
-# We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
+# Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
 
-# Get the parameter counts of the model
+# Get the parameter counts of our model
 param_counts = model.num_scaling_params()
 print0(f"Parameter counts:")
 for key, value in param_counts.items():
@@ -250,23 +256,85 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-# Scaling params: transformer matrices + lm_head (gives cleanest scaling laws, see dev/LOG.md Jan 27, 2026)
-get_scaling_params = lambda m: m.num_scaling_params()['transformer_matrices'] + m.num_scaling_params()['lm_head']
+# 1) Use scaling laws to determine the optimal training horizon in tokens
+# The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
+# We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
+def get_scaling_params(m):
+    # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
+    params_counts = m.num_scaling_params()
+    scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
+    return scaling_params
 num_scaling_params = get_scaling_params(model)
-target_tokens = int(args.target_param_data_ratio * num_scaling_params)
+target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
-# Auto-compute optimal batch size based on Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
-total_batch_size = args.total_batch_size
+# Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
+d12_ref = build_model_meta(12) # creates the model on meta device
+D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
+B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
+
+# 2) Now that we have the token horizon, we can calculate the optimal batch size
+# We follow the Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
+# The optimal batch size grows as approximately D^0.383, so e.g. if D doubles from d12 to d24, B should grow by 2^0.383 ≈ 1.3x.
+total_batch_size = args.total_batch_size # user-provided override is possible
 if total_batch_size == -1:
-    d12_ref = build_model_meta(12) # d12 is where the optimal batch size was measured to be 2**19 tokens
-    d12_num_scaling_params = get_scaling_params(d12_ref)
-    D_REF = args.target_param_data_ratio * d12_num_scaling_params
-    B_REF = 2**19
     batch_size_ratio = target_tokens / D_REF
-    total_batch_size = 2 ** round(math.log2(B_REF * batch_size_ratio ** 0.383)) # also clamp to power of 2
+    predicted_batch_size = B_REF * batch_size_ratio ** 0.383
+    total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
 
-# Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
+# 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
+batch_lr_scale = 1.0
+batch_ratio = total_batch_size / B_REF # B/B_ref
+if batch_ratio != 1.0:
+    # SGD: linear scaling with batch size is standard (not used in nanochat)
+    # AdamW: sqrt scaling is standard: η ∝ √(B/B_ref)
+    # Muon: we will use the same scaling for Muon as for AdamW: η ∝ √(B/B_ref) (not studied carefully, assumption!)
+    batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
+    print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
+
+# 4) Knowing the batch size and the token horizon, we can now calculate the appropriate weight decay scaling
+# We adopt the T_epoch framework from https://arxiv.org/abs/2405.13698
+# Central idea of the paper is that T_epoch = B/(η·λ·D) should remain constant.
+# Above, we used learning rate scaling η ∝ √(B/B_ref). So it's a matter of ~10 lines of math to derive that to keep T_epoch constant, we need:
+# λ = λ_ref · √(B/B_ref) · (D_ref/D)
+# Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
+weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
+if weight_decay_scaled != args.weight_decay:
+    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
+
+# -----------------------------------------------------------------------------
+# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+optimizer = model.setup_optimizer(
+    # AdamW hyperparameters
+    unembedding_lr=args.unembedding_lr * batch_lr_scale,
+    embedding_lr=args.embedding_lr * batch_lr_scale,
+    scalar_lr=args.scalar_lr * batch_lr_scale,
+    # Muon hyperparameters
+    matrix_lr=args.matrix_lr * batch_lr_scale,
+    weight_decay=weight_decay_scaled,
+)
+
+if resuming:
+    optimizer.load_state_dict(optimizer_data)
+    del optimizer_data
+
+# -----------------------------------------------------------------------------
+# GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
+scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
+if scaler is not None:
+    print0("GradScaler enabled for fp16 training")
+
+# -----------------------------------------------------------------------------
+# Initialize the DataLoaders for train/val
+dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+
+# -----------------------------------------------------------------------------
+# Calculate the number of iterations we will train for and set up the various schedulers
+
+# num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
 assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
 if args.num_iterations > 0:
     # Override num_iterations to a specific value if given
@@ -282,67 +350,14 @@ elif args.target_param_data_ratio > 0:
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
-total_tokens = total_batch_size * num_iterations
+total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
 print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # Chinchilla is ~20
+print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
-# -----------------------------------------------------------------------------
-# Optimizer / data / training length related hyperparameters
-# figure out the needed gradient accumulation to reach the desired total batch size
-tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
-world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
-assert total_batch_size % world_tokens_per_fwdbwd == 0
-grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
-print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
-print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
-print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
-
-# Batch size scaling for learning rates (hyperparameters were tuned at reference batch size 2^19)
-batch_lr_scale = 1.0
-reference_batch_size = 2**19
-batch_ratio = total_batch_size / reference_batch_size
-if batch_ratio != 1.0:
-    # SGD: linear scaling with batch size is standard (not used in nanochat)
-    # AdamW: sqrt scaling is standard
-    # Muon: sqrt scaling is an assumption - not fully studied, but it's a second-order-ish optimizer
-    batch_lr_scale = batch_ratio ** 0.5
-    print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {reference_batch_size:,})")
-
-# Weight decay is tuned at d12 and its scaling seems to be \propto 1/channels^2 (or equivalently, \propto 1/depth^2 due to constant aspect ratio)
-weight_decay_scaled = args.weight_decay * (12 / args.depth)**2
-if args.depth != 12:
-    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
-
-# -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-adam_betas = (args.adam_beta1, args.adam_beta2)
-optimizer = model.setup_optimizer(
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    matrix_lr=args.matrix_lr * batch_lr_scale,
-    weight_decay=weight_decay_scaled,
-    adam_betas=adam_betas,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-)
-
-if resuming:
-    optimizer.load_state_dict(optimizer_data)
-    del optimizer_data
-
-# -----------------------------------------------------------------------------
-# Initialize the DataLoaders for train/val
-dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
-
-# -----------------------------------------------------------------------------
-# Set up hyperparameter schedulers
-
-# Learning rate scheduler
+# Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
-    warmup_iters = round(args.warmup_ratio * num_iterations)
+    warmup_iters = args.warmup_steps
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     if it < warmup_iters:
         return (it + 1) / warmup_iters
@@ -352,19 +367,27 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
-# Momentum scheduler for Muon optimizer
+# Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
-    frac = min(it / 300, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.95
-    return momentum
+    warmdown_iters = round(args.warmdown_ratio * num_iterations)
+    warmdown_start = num_iterations - warmdown_iters
+    if it < 400:
+        frac = it / 400
+        return (1 - frac) * 0.85 + frac * 0.97
+    elif it >= warmdown_start:
+        progress = (it - warmdown_start) / warmdown_iters
+        return 0.97 * (1 - progress) + 0.90 * progress
+    else:
+        return 0.97
 
-# Weight decay scheduler for Muon optimizer (linear to zero over the course of training)
+# Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
 def get_weight_decay(it):
-    return weight_decay_scaled * (1 - it / num_iterations)
+    return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
 # -----------------------------------------------------------------------------
-# Loop state (variables updated by the training loop)
+# Training loop
 
+# Loop state (variables updated by the training loop)
 if not resuming:
     step = 0
     val_bpb = None # will be set if eval_every > 0
@@ -379,8 +402,16 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
-# -----------------------------------------------------------------------------
-# Training loop
+# Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
+tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
+world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
+assert total_batch_size % world_tokens_per_fwdbwd == 0
+grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
+print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
+print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
+print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+
+# Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
@@ -390,7 +421,7 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with disable_fp8(model), autocast_ctx:
+        with disable_fp8(model):
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
@@ -409,7 +440,7 @@ while True:
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
-        with disable_fp8(orig_model), autocast_ctx:
+        with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
@@ -436,7 +467,7 @@ while True:
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model), autocast_ctx:
+            with disable_fp8(orig_model):
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
@@ -455,6 +486,7 @@ while True:
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
+                "total_batch_size": total_batch_size,
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
@@ -475,11 +507,13 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
+        loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -490,7 +524,18 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
-    optimizer.step()
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+        # In distributed training, all ranks must agree on whether to skip the step.
+        # Each rank may independently encounter inf/nan gradients, so we all-reduce
+        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
+        if is_ddp_initialized():
+            for v in scaler._found_inf_per_device(optimizer).values():
+                dist.all_reduce(v, op=dist.ReduceOp.MAX)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -517,8 +562,8 @@ while True:
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
     else:
         eta_str = ""
-    epoch = dataloader_state_dict["epoch"]
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -564,7 +609,7 @@ get_report().log(section="Base model training", data=[
         "Number of training tokens": total_tokens,
         "Tokens : Scaling params ratio": total_batch_size * num_iterations / num_scaling_params,
         "DDP world size": ddp_world_size,
-        "warmup_ratio": args.warmup_ratio,
+        "warmup_steps": args.warmup_steps,
         "warmdown_ratio": args.warmdown_ratio,
         "final_lr_frac": args.final_lr_frac,
     },
