@@ -61,17 +61,16 @@ wait $DATASET_DOWNLOAD_PID
 
 echo "开始基础大模型预训练..."
 # 【核心修改区】
-# - 改成了单卡并行 (--nproc_per_node=1)
-# - 将深度缩小至 d12 (--depth=12)，极大加快单卡训练速度
-# - 批次设为 16 (--device-batch-size=16)，刚好填满或适合单张 A100 的 40G 显存
-# - 删除了不支持/没必要的 --fp8 加速配置
+# - 批次由 16 修改为 32 (--device-batch-size=32)，吃满 40G 显存
+# - 增加 --window-pattern L，解决无 Flash Attention 时的严重算力瓶颈
 torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --depth=12 \
-    --device-batch-size=16 \
+    --device-batch-size=32 \
+    --window-pattern L \
     --run=$WANDB_RUN
 
 # 评估刚训好的基础模型能力 (CORE 分数、Loss损失 等)
-torchrun --standalone --nproc_per_node=1 -m scripts.base_eval -- --device-batch-size=16
+torchrun --standalone --nproc_per_node=1 -m scripts.base_eval -- --device-batch-size=32
 
 # -----------------------------------------------------------------------------
 # SFT 有监督微调（教会模型聊天格式、不要乱说废话，并注入人格）
@@ -81,9 +80,10 @@ echo "下载合成的对话数据..."
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 echo "开始 SFT 监督微调..."
-# 启动聊天微调（同样修改为了单卡和适配的 batch size）
+# 启动聊天微调（同样保持高批次和全局注意力模式，确保不卡顿）
 torchrun --standalone --nproc_per_node=1 -m scripts.chat_sft -- \
-    --device-batch-size=16 \
+    --device-batch-size=32 \
+    --window-pattern L \
     --run=$WANDB_RUN
 
 # 评估聊天的 SFT 模型
